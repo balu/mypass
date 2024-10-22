@@ -662,6 +662,48 @@ def reencrypt(dbname="default"):
 def clip(name, dbname="default"):
     pyclip.copy(_secret(name, dbname=dbname))
 
+@command
+def rename(vfrom, vto, dbname="default"):
+    with authenticated(dbname) as (db, key):
+        vault = db['vaults'].find_one(name=vfrom)
+        vault_policy = db['vault_policy'].find_one(name=vfrom)
+
+        if not vault and not vault_policy:
+            return
+
+        new_vault = None
+        if vault:
+            new_vault = _make_vault (
+                key=key,
+                name=vto,
+                ctime=vault['ctime'],
+                secret=_extract_secret(key=key, **vault)
+            )
+
+        new_vault_policy = None
+        if vault_policy:
+            name=vto
+            format=vault_policy['format']
+            uinterval=vault_policy['uinterval']
+            ctime=vault_policy['ctime']
+            uname, uformat, uuinterval, uctime = map(_to_utf8, [name, format, uinterval, ctime])
+            new_vault_policy = dict (
+                name=name,
+                format=format,
+                uinterval=uinterval,
+                ctime=ctime,
+                digest=_encrypt(uname+uformat+uuinterval+uctime, key)
+            )
+
+        db.begin()
+        if new_vault:
+            db['vaults'].insert(new_vault)
+            db['vaults'].delete(**vault)
+        if new_vault_policy:
+            db['vault_policy'].insert(new_vault_policy)
+            db['vault_policy'].delete(**vault_policy)
+        db.commit()
+
 if __name__ == "__main__":
 
     mp_parser = ap.ArgumentParser(prog=PROG)
@@ -706,6 +748,11 @@ if __name__ == "__main__":
     clip_parser.add_argument('--db', dest='dbname', help='name of the database', default='default')
     clip_parser.add_argument('vault', help='vault name')
 
+    rename_parser = subparsers.add_parser('rename', help='rename a vault')
+    rename_parser.add_argument('--db', dest='dbname', help='name of the database', default='default')
+    rename_parser.add_argument('--from', dest='vfrom', help='current name')
+    rename_parser.add_argument('--to', dest='vto', help='new name')
+
     args = mp_parser.parse_args()
     match args.subcommand:
         case "generate":
@@ -736,3 +783,5 @@ if __name__ == "__main__":
             reencrypt(dbname=args.dbname)
         case "clip":
             clip(name=args.vault, dbname=args.dbname)
+        case "rename":
+            rename(vfrom=args.vfrom, vto=args.vto, dbname=args.dbname)

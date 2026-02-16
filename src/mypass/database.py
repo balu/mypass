@@ -48,6 +48,7 @@ AAD with main password and main.enc_salt as inputs to create a key.
 """
 
 import base64
+import collections.abc
 import datetime
 import io
 from pathlib import Path
@@ -71,10 +72,7 @@ class AuthenticationError(Exception):
 class IntegrityError(Exception):
     pass
 
-class VaultNotFoundError(Exception):
-    pass
-
-class VaultExistsError(Exception):
+class VaultNotFoundError(KeyError):
     pass
 
 def b64text(b: bytes) -> str:
@@ -197,7 +195,7 @@ Raises:
         _, enc_salt = encrypt(f"{PROGNAME}".encode('utf-8'), f"{PROGNAME}".encode('utf-8'), password)
 
         mac, mac_salt = kmac (
-            VERSION.encode('utf-8') + now.encode('utf-8') + pwhash.encode('utf-8') + b64text(enc_salt).encode('utf-8'),
+            VERSION.encode('utf-8') + now.encode('utf-8') + pwhash.encode('utf-8') + enc_salt,
             password
         )
 
@@ -217,7 +215,7 @@ Raises:
     except Exception as e:
         raise DatabaseError(f"Failed to create database at {dbpath}: {e}")
     
-class AuthenticatedDatabase:
+class AuthenticatedDatabase(collections.abc.MutableMapping):
     """An authenticated database.
     """
 
@@ -266,23 +264,27 @@ within the context are rolled back.
         if exc_type is None:
             if self._connection.total_changes > 0:
                 try:
+                    self._connection.execute (
+                        "UPDATE main SET last_updated = ? WHERE version = ?",
+                        (utcnowiso(), VERSION)
+                    )
                     mac, mac_salt = kmac(self._all_bytes(), self._password) # TODO: Can connection read uncommitted data?
                     self._connection.execute (
                         "UPDATE main SET mac_salt = ?, mac = ? WHERE version = ?",
                         (b64text(mac_salt), b64text(mac), VERSION)
                     )
                     self._connection.commit()
+                    self._connection.close()
                     return False
                 except sqlite3.Error:
                     self._connection.close()
                     raise DatabaseError(f"Failed to commit changes to database {self._dbpath}")
-        else:
-            self._connection.close()
 
+        self._connection.close()
         del self._password
         return False
 
-    def get(self, name: str) -> bytes:
+    def __getitem__(self, name: str) -> bytes:
         """Get the plain-text secret stored in vault name."""
 
         try:
@@ -298,7 +300,7 @@ within the context are rolled back.
         except nacl.exceptions.CryptoError:
             raise IntegrityError(f"Possibly corrupt secret in vault {name} in {self._dbpath}.")
 
-    def set(self, name: str, plaintext: bytes):
+    def __setitem__(self, name: str, plaintext: bytes):
         """Store plaintext encrypted and authenticated in vault name.
 
 The secret is stored using authenticated encryption where the name is
@@ -314,26 +316,70 @@ cipher-text originally stored along with a different vault name.
             (name, b64text(ciphertext))
         )
 
+    def __delitem__(self, name: str):
+        """Delete vault name from the database."""
+
+        try:
+            cursor = self._connection.execute (
+                "DELETE FROM vaults WHERE name = ?",
+                (name, )
+            )
+            if cursor.rowcount == 0:
+                raise VaultNotFoundError(f"Vault {name} not found in database {self._dbpath}.")
+        except sqlite3.Error:
+            raise DatabaseError(f"Vault {name} could not be deleted from database {self._dbpath}.")
+
+    def __iter__(self):
+        """Iterator over vaults."""
+
+        try:
+            rows = self._connection.execute("SELECT name FROM vaults ORDER BY name").fetchall()
+            return iter(row[0] for row in rows)
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+
+    def __len__(self):
+        """Return the number of vaults in the database."""
+        try:
+            result_row = self._connection.execute(
+                "SELECT COUNT(*) FROM vaults"
+            ).fetchone()
+            return result_row[0]
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+
+    def __contains__(self, name):
+        try:
+            result_row = self._connection.execute(
+                "SELECT 1 FROM vaults WHERE name = ?", (name,)
+            ).fetchone()
+            return result_row is not None
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+
     def _all_bytes(self) -> bytes:
         """Return bytes to compute MAC."""
 
-        result_row = self._connection.execute (
-            "SELECT version, last_updated, pwhash, enc_salt FROM MAIN WHERE version = ?",
-            (VERSION,)
-        ).fetchone()
-        if result_row is None:
-            raise DatabaseError(f"Failed to fetch main row from database {dbpath}.")
-
-        version, last_updated, pwhash, enc_salt = result_row
-
-        data = version.encode('utf-8') + last_updated.encode('utf-8') + pwhash.encode('utf-8') + textb64(enc_salt)
-
-        for row in self._connection.execute("SELECT name, secret FROM vaults ORDER BY name"):
-            name = row[0]
-            secret = row[1]
-            data = data + name.encode('utf-8') + secret.encode('utf-8')
-
-        return data
+        try:
+            result_row = self._connection.execute (
+                "SELECT version, last_updated, pwhash, enc_salt FROM MAIN WHERE version = ?",
+                (VERSION,)
+            ).fetchone()
+            if result_row is None:
+                raise DatabaseError(f"Failed to fetch main row from database {self._dbpath}.")
+    
+            version, last_updated, pwhash, enc_salt = result_row
+    
+            data = version.encode('utf-8') + last_updated.encode('utf-8') + pwhash.encode('utf-8') + textb64(enc_salt)
+    
+            for row in self._connection.execute("SELECT name, secret FROM vaults ORDER BY name"):
+                name = row[0]
+                secret = row[1]
+                data = data + name.encode('utf-8') + textb64(secret)
+    
+            return data
+        except sqlite3.Error:
+            raise DatabaseError(f"Database operation failed on {self._dbpath}.")
 
 def authenticated(dbpath: Path, password: str):
     """Acquire an authenticated database at dbpath using password.
@@ -371,7 +417,24 @@ Raises:
     DatabaseError: If some database operation failed.
     AuthenticationError: If password verification failed.
     """
-    pass
+
+    with authenticated(dbpath, password) as adb:
+        try:
+            result_row = adb._connection.execute(
+                "SELECT mac_salt, mac FROM main WHERE version = ?",
+                (VERSION,)
+            ).fetchone()
+        except sqlite3.Error:
+            raise DatabaseError(f"Some operation on database {dbpath} failed.")
+
+        if result_row is None:
+            raise DatabaseError(f"Failed to fetch main row from database {dbpath}.")
+
+        mac_salt, mac = result_row
+
+        expected_mac, _ = kmac(adb._all_bytes(), password, textb64(mac_salt))
+
+        return expected_mac == textb64(mac)
 
 def relock(dbpath: Path, old_password: str, new_password: str):
     """Relock the database using a new password.
@@ -389,6 +452,7 @@ Raises:
     IntegrityError: If the database is corrupt.
     AuthenticationError: If old_password verification failed..
     """
+
     pass
 
 def backup(dbpath: Path, password: str, fobj: io.FileIO):

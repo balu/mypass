@@ -104,16 +104,57 @@ def test_verify_detects_tampered_secret(testdb):
     assert mpd.verify(testdb, 'test_password') == False
 
 def test_verify_detects_tampered_vault_name(testdb):
-    pass
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        adb['hello'] = b'world'
+
+    connection = sqlite3.connect(testdb)
+    connection.execute("UPDATE vaults SET name = 'hell0' WHERE name = 'hello'")
+    connection.commit()
+    connection.close()
+
+    assert mpd.verify(testdb, 'test_password') == False
 
 def test_verify_detects_swapped_secrets(testdb):
-    pass
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        adb['a'] = b'alpha'
+        adb['b'] = b'beta'
+
+    connection = sqlite3.connect(testdb)
+    cur = connection.cursor()
+    cur.execute("SELECT secret FROM vaults WHERE name = ?", ('a',))
+    secret_a = cur.fetchone()[0]
+    cur.execute("SELECT secret FROM vaults WHERE name = ?", ('b',))
+    secret_b = cur.fetchone()[0]
+
+    cur.execute("UPDATE vaults SET secret = ? WHERE name = ?", (secret_b, 'a'))
+    cur.execute("UPDATE vaults SET secret = ? WHERE name = ?", (secret_a, 'b'))
+    connection.commit()
+    connection.close()
+
+    assert mpd.verify(testdb, 'test_password') == False
 
 def test_verify_detects_tampered_main_row(testdb):
-    pass
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        adb['hello'] = b'world'
+
+    connection = sqlite3.connect(testdb)
+    connection.execute("UPDATE main SET last_updated = 'tampered' WHERE version = ?", ('0.2',))
+    connection.commit()
+    connection.close()
+
+    assert mpd.verify(testdb, 'test_password') == False
 
 def test_verify_detects_deleted_vaults(testdb):
-    pass
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        adb['one'] = b'1'
+        adb['two'] = b'2'
+
+    connection = sqlite3.connect(testdb)
+    connection.execute("DELETE FROM vaults WHERE name = ?", ('two',))
+    connection.commit()
+    connection.close()
+
+    assert mpd.verify(testdb, 'test_password') == False
 
 def test_delitem(authdb):
     authdb['hello'] = b'world'

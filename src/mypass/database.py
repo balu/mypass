@@ -51,8 +51,10 @@ import base64
 import collections.abc
 import datetime
 import io
+import os
 from pathlib import Path
 import sqlite3
+import tempfile
 from typing import Tuple
 
 import nacl.hash
@@ -436,11 +438,11 @@ Raises:
 
         return expected_mac == textb64(mac)
 
-def relock(dbpath: Path, old_password: str, new_password: str):
+def relock(old_path: Path, old_password: str, new_password: str):
     """Relock the database using a new password.
 
 Parameters:
-    dbpath (Path): Path to the database file.
+    old_path (Path): Path to the database file.
     old_password (str): Old password locking the database.
     new_password (str): New password to lock the database
 
@@ -448,12 +450,34 @@ Returns:
     None: On success.
 
 Raises:
-    FileNotFoundError: If there is no file at dbpath.
+    FileNotFoundError: If there is no file at old_path.
     IntegrityError: If the database is corrupt.
     AuthenticationError: If old_password verification failed..
+    DatabaseError: If some database operation failed.
     """
 
-    pass
+    temp_path = None
+
+    try:
+        fd, temp_name = tempfile.mkstemp(suffix='.db', dir=old_path.parent)
+        temp_path = Path(temp_name)
+        os.close(fd)
+        temp_path.unlink()
+
+        initialize(temp_path, new_password)
+        with authenticated(old_path, old_password) as old_db:
+            with authenticated(temp_path, new_password) as temp_db:
+                for vault in old_db:
+                    temp_db[vault] = old_db[vault]
+        os.replace(temp_path, old_path)
+    except FileExistsError:
+        raise DatabaseError(f"Failed to relock database {old_path}.")
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
 def backup(dbpath: Path, password: str, fobj: io.FileIO):
     """Backup the database into a file-like object.

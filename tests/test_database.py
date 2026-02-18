@@ -231,3 +231,29 @@ def test_contains_after_delete(authdb):
     del authdb['hello']
     assert 'hello' not in authdb
 
+def test_relock_changes_password_and_preserves_vaults(testdb):
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        adb['hello'] = b'world'
+        adb['foo'] = b'bar'
+
+    mpd.relock(testdb, 'test_password', 'new_password')
+
+    with pytest.raises(mpd.AuthenticationError):
+        mpd.authenticated(testdb, 'test_password')
+
+    assert mpd.verify(testdb, 'new_password')
+    with mpd.authenticated(testdb, 'new_password') as adb:
+        assert adb['hello'] == b'world'
+        assert adb['foo'] == b'bar'
+
+def test_relock_fails_with_wrong_old_password_and_keeps_db(testdb):
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        adb['keep'] = b'data'
+
+    with pytest.raises(mpd.AuthenticationError):
+        mpd.relock(testdb, 'wrong_password', 'new_password')
+
+    assert mpd.verify(testdb, 'test_password')
+    with mpd.authenticated(testdb, 'test_password') as adb:
+        assert adb['keep'] == b'data'
+

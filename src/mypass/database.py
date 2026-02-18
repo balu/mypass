@@ -49,6 +49,7 @@ AAD with main password and main.enc_salt as inputs to create a key.
 
 import base64
 import collections.abc
+import contextlib
 import datetime
 import io
 import os
@@ -438,11 +439,35 @@ Raises:
 
         return expected_mac == textb64(mac)
 
-def relock(old_path: Path, old_password: str, new_password: str):
+@contextlib.contextmanager
+def verified(dbpath: Path, password: str):
+    """Acquire a fully verified database.
+
+Parameters:
+    dbpath (Path): Path to the database file.
+    password (str): Password to verify the database.
+
+Returns:
+    AuthenticatedDatabase: On success.
+
+Raises:
+    FileNotFoundError: If there is no file at dbpath.
+    DatabaseError: If some database operation failed.
+    AuthenticationError: If password verification failed.
+    IntegrityError: If the database is corrupt.
+"""
+
+    if not verify(dbpath, password):
+        raise IntegrityError(f"Verification failed on database {dbpath}.")
+
+    with authenticated(dbpath, password) as adb:
+        yield adb
+
+def relock(dbpath: Path, old_password: str, new_password: str):
     """Relock the database using a new password.
 
 Parameters:
-    old_path (Path): Path to the database file.
+    dbpath (Path): Path to the database file.
     old_password (str): Old password locking the database.
     new_password (str): New password to lock the database
 
@@ -450,7 +475,7 @@ Returns:
     None: On success.
 
 Raises:
-    FileNotFoundError: If there is no file at old_path.
+    FileNotFoundError: If there is no file at dbpath.
     IntegrityError: If the database is corrupt.
     AuthenticationError: If old_password verification failed..
     DatabaseError: If some database operation failed.
@@ -459,19 +484,19 @@ Raises:
     temp_path = None
 
     try:
-        fd, temp_name = tempfile.mkstemp(suffix='.db', dir=old_path.parent)
+        fd, temp_name = tempfile.mkstemp(suffix='.db', dir=dbpath.parent)
         temp_path = Path(temp_name)
         os.close(fd)
         temp_path.unlink()
 
         initialize(temp_path, new_password)
-        with authenticated(old_path, old_password) as old_db:
+        with verified(dbpath, old_password) as old_db:
             with authenticated(temp_path, new_password) as temp_db:
                 for vault in old_db:
                     temp_db[vault] = old_db[vault]
-        os.replace(temp_path, old_path)
+        os.replace(temp_path, dbpath)
     except FileExistsError:
-        raise DatabaseError(f"Failed to relock database {old_path}.")
+        raise DatabaseError(f"Failed to relock database {dbpath}.")
     finally:
         if temp_path is not None and temp_path.exists():
             try:
@@ -479,11 +504,16 @@ Raises:
             except Exception:
                 pass
 
-def backup(dbpath: Path, password: str, fobj: io.FileIO):
+def backup(dbpath: Path, aad: str, password: str, fobj: io.FileIO) -> None:
     """Backup the database into a file-like object.
 
 All contents of the database are encrypted and authenticated in the
 file-like object. In particular, the keys are encrypted as well.
+
+Parameters:
+    dbpath (Path): Path to the database file.
+    aad (str): Authenticated associated data in the backup file.
+    password (str): Old password locking the database.
 
 Returns:
     None: On success.
@@ -492,10 +522,29 @@ Raises:
     FileNotFoundError: If there is no file at dbpath.
     IntegrityError: If the database is corrupt.
     AuthenticationError: If password verification failed..
+    ValueError: If the aad is too long.
     """
-    pass
 
-def restore(infile: io.FileIO, password: str, outfile: io.FileIO):
+    aad_bytes = aad.encode('utf-8')
+    n = len(aad_bytes)
+    if n > 65535:
+        raise ValueError(f"Associated data to backup {dbpath} is too long.")
+    n_high, n_low = map(int.to_bytes, (n // 256, n % 256))
+
+    if not verify(dbpath, password):
+        raise IntegrityError(f"Verification failed for database {dbpath}.")
+
+    with open(dbpath, "rb") as dbfile:
+        salt, encrypted_data = encrypt(dbfile.readall(), aad, password)
+        fobj.truncate(size=0)
+        fobj.write(int.to_bytes(len(salt)))
+        fobj.write(salt)
+        fobj.write(n_high)
+        fobj.write(n_low)
+        fobj.write(aad_bytes)
+        fobj.write(encrypted_data)
+
+def restore(infile: io.FileIO, aad: str, password: str, outfile: io.FileIO) -> None:
     """Restore a database into outfile from infile.
 
 Returns:

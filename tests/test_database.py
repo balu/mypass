@@ -29,14 +29,14 @@ def testdb():
     yield testdb
 
 def test_authentication_succeeds_with_correct_password(testdb):
-    try:
-        mpd.authenticated(testdb, 'test_password')
-    except:
-        assert False
+    with mpd.authenticated(testdb, 'test_password'):
+        return
+    assert False
 
 def test_authentication_fails_with_wrong_password(testdb):
     with pytest.raises(mpd.AuthenticationError):
-        mpd.authenticated(testdb, 'wrong_password')
+        with mpd.authenticated(testdb, 'wrong_password'):
+            pass
 
 @pytest.fixture
 def authdb(testdb):
@@ -76,21 +76,27 @@ def test_multiple_set_get(authdb):
         assert f"world{i}".encode('utf-8') == authdb[f"hello{i}"]
 
 def test_verify_succeeds_on_fresh_database(testdb):
-    assert mpd.verify(testdb, 'test_password') == True
+    with mpd.verified(testdb, 'test_password'):
+        return
+    assert False
 
 def test_verify_fails_with_wrong_password(testdb):
     with pytest.raises(mpd.AuthenticationError):
-        mpd.verify(testdb, 'wrong_password')
+        with mpd.verified(testdb, 'wrong_password'):
+            pass
 
 def test_verify_fails_on_nonexistent_database():
     with pytest.raises(FileNotFoundError):
-        mpd.verify(Path('/tmp/nonexistent.db'), 'test_password')
+        with mpd.verified(Path('/tmp/nonexistent.db'), 'test_password'):
+            pass
 
 def test_verify_succeeds_after_set(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
         adb['hello'] = b'world'
 
-    assert mpd.verify(testdb, 'test_password') == True
+    with mpd.verified(testdb, 'test_password'):
+        return
+    assert False
 
 def test_verify_detects_tampered_secret(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
@@ -101,7 +107,9 @@ def test_verify_detects_tampered_secret(testdb):
     connection.commit()
     connection.close()
 
-    assert mpd.verify(testdb, 'test_password') == False
+    with pytest.raises(mpd.IntegrityError):
+        with mpd.verified(Path(testdb), 'test_password'):
+            pass
 
 def test_verify_detects_tampered_vault_name(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
@@ -112,7 +120,9 @@ def test_verify_detects_tampered_vault_name(testdb):
     connection.commit()
     connection.close()
 
-    assert mpd.verify(testdb, 'test_password') == False
+    with pytest.raises(mpd.IntegrityError):
+        with mpd.verified(Path(testdb), 'test_password'):
+            pass  
 
 def test_verify_detects_swapped_secrets(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
@@ -131,7 +141,9 @@ def test_verify_detects_swapped_secrets(testdb):
     connection.commit()
     connection.close()
 
-    assert mpd.verify(testdb, 'test_password') == False
+    with pytest.raises(mpd.IntegrityError):
+        with mpd.verified(Path(testdb), 'test_password'):
+            pass
 
 def test_verify_detects_tampered_main_row(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
@@ -142,7 +154,9 @@ def test_verify_detects_tampered_main_row(testdb):
     connection.commit()
     connection.close()
 
-    assert mpd.verify(testdb, 'test_password') == False
+    with pytest.raises(mpd.IntegrityError):
+        with mpd.verified(Path(testdb), 'test_password'):
+            pass
 
 def test_verify_detects_deleted_vaults(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
@@ -154,7 +168,9 @@ def test_verify_detects_deleted_vaults(testdb):
     connection.commit()
     connection.close()
 
-    assert mpd.verify(testdb, 'test_password') == False
+    with pytest.raises(mpd.IntegrityError):
+        with mpd.verified(Path(testdb), 'test_password'):
+            pass
 
 def test_delitem(authdb):
     authdb['hello'] = b'world'
@@ -239,12 +255,12 @@ def test_relock_changes_password_and_preserves_vaults(testdb):
     mpd.relock(testdb, 'test_password', 'new_password')
 
     with pytest.raises(mpd.AuthenticationError):
-        mpd.authenticated(testdb, 'test_password')
+        with mpd.authenticated(testdb, 'test_password'):
+            pass
 
-    assert mpd.verify(testdb, 'new_password')
-    with mpd.authenticated(testdb, 'new_password') as adb:
-        assert adb['hello'] == b'world'
-        assert adb['foo'] == b'bar'
+    with mpd.verified(testdb, 'new_password') as vdb:
+        assert vdb['hello'] == b'world'
+        assert vdb['foo'] == b'bar'
 
 def test_relock_fails_with_wrong_old_password_and_keeps_db(testdb):
     with mpd.authenticated(testdb, 'test_password') as adb:
@@ -253,7 +269,6 @@ def test_relock_fails_with_wrong_old_password_and_keeps_db(testdb):
     with pytest.raises(mpd.AuthenticationError):
         mpd.relock(testdb, 'wrong_password', 'new_password')
 
-    assert mpd.verify(testdb, 'test_password')
-    with mpd.authenticated(testdb, 'test_password') as adb:
-        assert adb['keep'] == b'data'
+    with mpd.verified(testdb, 'test_password') as vdb:
+        assert vdb['keep'] == b'data'
 

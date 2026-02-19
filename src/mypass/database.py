@@ -45,6 +45,43 @@ nacl.pwhash.str(). main.mac is computed using blake2b algorithm with the
 main password and main.mac_salt as inputs to create a key. The column
 vaults.secret is encrypted using nacl.secret.Aead with vaults.name as
 AAD with main password and main.enc_salt as inputs to create a key.
+
+Usage
+-----
+
+Initialize a database in file "xyz.db" and encrypt all secrets using the
+password "hunter2":
+
+    initialize(Path("xyz.db"), "hunter2")
+
+Acquire the database "xyz.db" using the password "hunter2" and access
+secrets after decrypting and authenticating.
+
+    with authenticated(Path("xyz.db"), "hunter2") as adb:
+        print('foo =>', adb['foo'].decode('utf-8'))
+
+Same as above but also verify that no tampering has occurred before
+reading any data from the database:
+
+    with verified(Path("xyz.db"), "hunter2") as vdb:
+        for vault in vdb:
+            print(vault)
+
+Change the password used to encrypt secrets.
+
+    relock(Path("xyz.db"), "hunter2", "hunter3")
+
+Make an authenticated encrypted backup of database "xyz.db" into a file
+"xyz.db.bak":
+
+    with open("xyz.db.bak", "wb") as bakfile:
+        backup(Path(f"{name}.db"), "hunter3", "Don't worry. This backup is safe.", bakfile)
+
+Restore a backup.
+
+    with open("xyz.db", "wb") as dbfile:
+        aad = restore(bakfile, "hunter3", dbfile)
+    print("The backup with message \"{aad}\" is restored.")
 """
 
 import base64
@@ -66,87 +103,6 @@ import nacl.utils
 PROGNAME='mypass'
 VERSION = '0.2'
 
-class DatabaseError(Exception):
-    pass
-
-class AuthenticationError(Exception):
-    pass
-
-class IntegrityError(Exception):
-    pass
-
-class VaultNotFoundError(KeyError):
-    pass
-
-def b64text(b: bytes) -> str:
-    """A Python string of the base64 encoding of bytes b."""
-    return base64.b64encode(b).decode('utf-8')
-
-def textb64(s: str) -> bytes:
-    """Bytes by decoding base64 string."""
-    return base64.b64decode(s.encode('utf-8'))
-
-def utcnowiso() -> str:
-    """Return current UTC time in ISO format."""
-    return datetime.datetime.now(datetime.UTC).isoformat()
-
-def kmac(b: bytes, password: str, salt: None | bytes = None) -> Tuple[bytes, bytes]:
-    """Compute keyed MAC of bytes b using a key derived from password and salt."""
-
-    if salt is None:
-        salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
-
-    key = nacl.pwhash.argon2id.kdf (
-        nacl.hash.BLAKE2B_KEYBYTES,
-        password.encode('utf-8'),
-        salt,
-        opslimit=nacl.pwhash.OPSLIMIT_INTERACTIVE,
-        memlimit=nacl.pwhash.MEMLIMIT_INTERACTIVE
-    )
-
-    return (
-        nacl.hash.blake2b (
-            b,
-            key=key,
-            person=f"{PROGNAME}-{VERSION}".encode('utf-8'),
-            encoder=nacl.encoding.RawEncoder
-        ),
-        salt
-    )
-
-def encrypt(plain: bytes, aad: bytes, password: str, salt: None | bytes = None) -> Tuple[bytes, bytes]:
-    """Encrypt plain with authenticated associated data aad using password and salt."""
-
-    if salt is None:
-        salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
-
-    key = nacl.pwhash.argon2id.kdf (
-        nacl.secret.Aead.KEY_SIZE,
-        password.encode('utf-8'),
-        salt,
-        opslimit=nacl.pwhash.OPSLIMIT_INTERACTIVE,
-        memlimit=nacl.pwhash.MEMLIMIT_INTERACTIVE
-    )
-
-    box = nacl.secret.Aead(key, nacl.encoding.RawEncoder)
-
-    return (box.encrypt(plain, aad), salt)
-
-def decrypt(secret: bytes, aad: bytes, password: str, salt: bytes) -> bytes:
-    """Decrypt secret after authenticating aad using password and salt."""
-
-    key = nacl.pwhash.argon2id.kdf (
-        nacl.secret.Aead.KEY_SIZE,
-        password.encode('utf-8'),
-        salt,
-        opslimit=nacl.pwhash.OPSLIMIT_INTERACTIVE,
-        memlimit=nacl.pwhash.MEMLIMIT_INTERACTIVE
-    )
-
-    box = nacl.secret.Aead(key, nacl.encoding.RawEncoder)
-
-    return box.decrypt(secret, aad)
-
 def initialize(dbpath: Path, password: str) -> None:
     """Initialize an empty database at dbpath.
 
@@ -160,6 +116,12 @@ Returns:
 Raises:
     FileExistsError: If a file already exists at dbpath.
     DatabaseError: If database creation failed.
+
+Usage:
+
+    Call initialize("xyz.db", "hunter2") to create an empty key-value
+store in a file named "xyz.db". All secrets will be encrypted and
+authenticated using the password "hunter2".
     """
 
     if dbpath.exists():
@@ -191,13 +153,13 @@ Raises:
     
         cursor.executescript(schema)
 
-        now = utcnowiso()
+        now = _utcnowiso()
 
         pwhash = nacl.pwhash.str(password.encode('utf-8')).decode('utf-8')
 
-        _, enc_salt = encrypt(f"{PROGNAME}".encode('utf-8'), f"{PROGNAME}".encode('utf-8'), password)
+        _, enc_salt = _encrypt(f"{PROGNAME}".encode('utf-8'), f"{PROGNAME}".encode('utf-8'), password)
 
-        mac, mac_salt = kmac (
+        mac, mac_salt = _kmac (
             VERSION.encode('utf-8') + now.encode('utf-8') + pwhash.encode('utf-8') + enc_salt,
             password
         )
@@ -208,7 +170,7 @@ Raises:
             INTO main (version, last_updated, pwhash, enc_salt, mac_salt, mac)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (VERSION, now, pwhash, b64text(enc_salt), b64text(mac_salt), b64text(mac))
+            (VERSION, now, pwhash, _b64text(enc_salt), _b64text(mac_salt), _b64text(mac))
         )
 
         cursor.close()
@@ -218,250 +180,82 @@ Raises:
     except Exception as e:
         raise DatabaseError(f"Failed to create database at {dbpath}: {e}")
     
-class AuthenticatedDatabase(collections.abc.MutableMapping):
-    """An authenticated database.
-    """
 
-    def __init__(self, dbpath: Path, password: str):
-       """
-       """
-       if not dbpath.exists():
-           raise FileNotFoundError(f"No database found at {dbpath}.")
-
-       try:
-           self._connection = sqlite3.connect(dbpath, autocommit=False)
-       except:
-           raise DatabaseError(f"Failed to establish connection to {dbpath}.")
-
-       try:
-           result_row = self._connection.execute (
-               "SELECT pwhash, enc_salt, mac_salt FROM main WHERE version = ?",
-               (VERSION,)
-           ).fetchone()
-           if result_row is None:
-               raise DatabaseError(f"Failed to fetch main row from database {dbpath}.")
-           pwhash = result_row[0]
-           nacl.pwhash.verify(pwhash.encode('utf-8'), password.encode('utf-8'))
-       except nacl.exceptions.InvalidkeyError:
-           raise AuthenticationError(f"Failed to unlock {dbpath} using given password.")
-       except sqlite3.Error:
-           raise DatabaseError(f"Some operation on database {dbpath} failed.")
-
-       self._dbpath = dbpath
-       self._enc_salt = textb64(result_row[1])
-       self._password = password
-
-    def __enter__(self):
-        """
-        """
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Cleanup after database operations.
-
-This function recomputes the database MAC if required and commits all
-changes if no exception occured. Otherwise, all changes that happened
-within the context are rolled back.
-"""
-
-        if exc_type is None:
-            if self._connection.total_changes > 0:
-                try:
-                    self._connection.execute (
-                        "UPDATE main SET last_updated = ? WHERE version = ?",
-                        (utcnowiso(), VERSION)
-                    )
-                    mac, mac_salt = kmac(self._all_bytes(), self._password) # TODO: Can connection read uncommitted data?
-                    self._connection.execute (
-                        "UPDATE main SET mac_salt = ?, mac = ? WHERE version = ?",
-                        (b64text(mac_salt), b64text(mac), VERSION)
-                    )
-                    self._connection.commit()
-                    self._connection.close()
-                    return False
-                except sqlite3.Error:
-                    self._connection.close()
-                    raise DatabaseError(f"Failed to commit changes to database {self._dbpath}")
-
-        self._connection.close()
-        del self._password
-        return False
-
-    def __getitem__(self, name: str) -> bytes:
-        """Get the plain-text secret stored in vault name."""
-
-        try:
-            result_row = self._connection.execute("SELECT secret FROM VAULTS WHERE name = ?",  (name,)).fetchone()
-            if result_row is None:
-                raise VaultNotFoundError(f"Vault {name} not found in database {self._dbpath}.")
-            ciphertext = result_row[0]
-
-            plaintext = decrypt(textb64(ciphertext), name.encode('utf-8'), self._password, self._enc_salt)
-            return plaintext
-        except sqlite3.Error:
-            raise DatabaseError(f"Database {self._dbpath} could not be read.")
-        except nacl.exceptions.CryptoError:
-            raise IntegrityError(f"Possibly corrupt secret in vault {name} in {self._dbpath}.")
-
-    def __setitem__(self, name: str, plaintext: bytes):
-        """Store plaintext encrypted and authenticated in vault name.
-
-The secret is stored using authenticated encryption where the name is
-the authenticated, associated data. This means that an attacker cannot
-replace, in an undetectable manner, the stored cipher-text with another
-cipher-text originally stored along with a different vault name.
-        """
-
-        ciphertext, _ = encrypt(plaintext, name.encode('utf-8'), self._password, self._enc_salt)
-
-        self._connection.execute (
-            "INSERT OR REPLACE INTO vaults (name, secret) VALUES (?, ?)",
-            (name, b64text(ciphertext))
-        )
-
-    def __delitem__(self, name: str):
-        """Delete vault name from the database."""
-
-        try:
-            cursor = self._connection.execute (
-                "DELETE FROM vaults WHERE name = ?",
-                (name, )
-            )
-            if cursor.rowcount == 0:
-                raise VaultNotFoundError(f"Vault {name} not found in database {self._dbpath}.")
-        except sqlite3.Error:
-            raise DatabaseError(f"Vault {name} could not be deleted from database {self._dbpath}.")
-
-    def __iter__(self):
-        """Iterator over vaults."""
-
-        try:
-            rows = self._connection.execute("SELECT name FROM vaults ORDER BY name").fetchall()
-            return iter(row[0] for row in rows)
-        except sqlite3.Error:
-            raise DatabaseError(f"Database {self._dbpath} could not be read.")
-
-    def __len__(self):
-        """Return the number of vaults in the database."""
-        try:
-            result_row = self._connection.execute(
-                "SELECT COUNT(*) FROM vaults"
-            ).fetchone()
-            return result_row[0]
-        except sqlite3.Error:
-            raise DatabaseError(f"Database {self._dbpath} could not be read.")
-
-    def __contains__(self, name):
-        try:
-            result_row = self._connection.execute(
-                "SELECT 1 FROM vaults WHERE name = ?", (name,)
-            ).fetchone()
-            return result_row is not None
-        except sqlite3.Error:
-            raise DatabaseError(f"Database {self._dbpath} could not be read.")
-
-    def _all_bytes(self) -> bytes:
-        """Return bytes to compute MAC."""
-
-        try:
-            result_row = self._connection.execute (
-                "SELECT version, last_updated, pwhash, enc_salt FROM MAIN WHERE version = ?",
-                (VERSION,)
-            ).fetchone()
-            if result_row is None:
-                raise DatabaseError(f"Failed to fetch main row from database {self._dbpath}.")
-    
-            version, last_updated, pwhash, enc_salt = result_row
-    
-            data = version.encode('utf-8') + last_updated.encode('utf-8') + pwhash.encode('utf-8') + textb64(enc_salt)
-    
-            for row in self._connection.execute("SELECT name, secret FROM vaults ORDER BY name"):
-                name = row[0]
-                secret = row[1]
-                data = data + name.encode('utf-8') + textb64(secret)
-    
-            return data
-        except sqlite3.Error:
-            raise DatabaseError(f"Database operation failed on {self._dbpath}.")
-
+@contextlib.contextmanager
 def authenticated(dbpath: Path, password: str):
-    """Acquire an authenticated database at dbpath using password.
+    """Acquire an authenticated database from dbpath using password.
 
 Parameters:
     dbpath (Path): Path to the database file.
     password (str): Password to authenticate.
 
-Returns:
-    AuthenticatedDatabase: On success.
-
 Raises:
     FileNotFoundError: If there is no file at dbpath.
     DatabaseError: If some database operation failed.
     AuthenticationError: If password verification failed.
+
+Usage:
+
+    This is a context manager for authenticated databases. Within the
+context manager, the database is available as a key-value store that
+maps string keys to values of type bytes. All methods of MutableMapping
+are available. The values are encrypted using password before storage.
+This context manager should be used to access existing databases when
+the goal is to add or remove very few key-value mappings or fetch the
+secret in plain-text for a key.
+
+        with authenticated("xyz.db", "hunter2") as adb:
+            adb['foo'] = b'bar'
+            del adb['baz']
+
+    Upon exit, all changes are written back to "xyz.db" or one of the
+exceptions is raised.
     """
 
-    return AuthenticatedDatabase(dbpath, password)
-
-def verify(dbpath: Path, password: str):
-    """Verify the database at dbpath using password.
-
-The database is secure if and only if it has been created or modified
-with knowledge of password.
-
-Parameters:
-    dbpath (Path): Path to the database file.
-    password (str): Password to verify the database.
-
-Returns:
-    Bool: True if and only if database is secure.
-
-Raises:
-    FileNotFoundError: If there is no file at dbpath.
-    DatabaseError: If some database operation failed.
-    AuthenticationError: If password verification failed.
-    """
-
-    with authenticated(dbpath, password) as adb:
-        try:
-            result_row = adb._connection.execute(
-                "SELECT mac_salt, mac FROM main WHERE version = ?",
-                (VERSION,)
-            ).fetchone()
-        except sqlite3.Error:
-            raise DatabaseError(f"Some operation on database {dbpath} failed.")
-
-        if result_row is None:
-            raise DatabaseError(f"Failed to fetch main row from database {dbpath}.")
-
-        mac_salt, mac = result_row
-
-        expected_mac, _ = kmac(adb._all_bytes(), password, textb64(mac_salt))
-
-        return expected_mac == textb64(mac)
+    db = _Database(dbpath)
+    db._authenticate(password)
+    yield db
+    db._writeback()
 
 @contextlib.contextmanager
 def verified(dbpath: Path, password: str):
-    """Acquire a fully verified database.
+    """Acquire a fully verified database from dbpath using password.
 
 Parameters:
     dbpath (Path): Path to the database file.
     password (str): Password to verify the database.
-
-Returns:
-    AuthenticatedDatabase: On success.
 
 Raises:
     FileNotFoundError: If there is no file at dbpath.
     DatabaseError: If some database operation failed.
     AuthenticationError: If password verification failed.
     IntegrityError: If the database is corrupt.
+
+Usage:
+
+    This is a context manager for acquiring fully verified databases.
+Within the context manager, the database is available using the same
+interface as that of authenticated(). The verified() context manager
+should be used when accessing only the vault names without looking at
+the associated secrets, for example, when listing all the vault names.
+An authenticated, but unverified database could have vault names that
+have been inserted by an attacker. The time taken to acquire a fully
+verified database increases with the number of key-value mappings in the
+database.
+
+        with verified("xyz.db", "hunter2") as vdb:
+            for vault in vdb:
+                print(vault)
+
+    Upon exit, all changes are written back to "xyz.db" or one of the
+exceptions is raised.
 """
+    db = _Database(dbpath)
+    db._authenticate(password)
+    db._verify()
+    yield db
+    db._writeback()
 
-    if not verify(dbpath, password):
-        raise IntegrityError(f"Verification failed on database {dbpath}.")
-
-    with authenticated(dbpath, password) as adb:
-        yield adb
 
 def relock(dbpath: Path, old_password: str, new_password: str):
     """Relock the database using a new password.
@@ -491,7 +285,7 @@ Raises:
 
         initialize(temp_path, new_password)
         with verified(dbpath, old_password) as old_db:
-            with authenticated(temp_path, new_password) as temp_db:
+            with verified(temp_path, new_password) as temp_db:
                 for vault in old_db:
                     temp_db[vault] = old_db[vault]
         os.replace(temp_path, dbpath)
@@ -525,34 +319,298 @@ Raises:
     ValueError: If the aad is too long.
     """
 
-    aad_bytes = aad.encode('utf-8')
-    n = len(aad_bytes)
-    if n > 65535:
-        raise ValueError(f"Associated data to backup {dbpath} is too long.")
-    n_high, n_low = map(int.to_bytes, (n // 256, n % 256))
+    pass
 
-    if not verify(dbpath, password):
-        raise IntegrityError(f"Verification failed for database {dbpath}.")
-
-    with open(dbpath, "rb") as dbfile:
-        salt, encrypted_data = encrypt(dbfile.readall(), aad, password)
-        fobj.truncate(size=0)
-        fobj.write(int.to_bytes(len(salt)))
-        fobj.write(salt)
-        fobj.write(n_high)
-        fobj.write(n_low)
-        fobj.write(aad_bytes)
-        fobj.write(encrypted_data)
-
-def restore(infile: io.FileIO, aad: str, password: str, outfile: io.FileIO) -> None:
+def restore(infile: io.FileIO, password: str, outfile: io.FileIO) -> str:
     """Restore a database into outfile from infile.
 
 Returns:
-    None: On success.
+    str: Authenticated associated data upon successful restore.
 
 Raises:
     FileExistsError: If there is a file at dbpath.
     IntegrityError: If the backup in fobj or the restored database is corrupt.
     AuthenticationError: If password verification failed..
     """
+
     pass
+
+class DatabaseError(Exception):
+    pass
+
+class AuthenticationError(Exception):
+    pass
+
+class IntegrityError(Exception):
+    pass
+
+class VaultNotFoundError(KeyError):
+    pass
+
+def _b64text(b: bytes) -> str:
+    """A Python string of the base64 encoding of bytes b."""
+    return base64.b64encode(b).decode('utf-8')
+
+def _textb64(s: str) -> bytes:
+    """Bytes by decoding base64 string."""
+    return base64.b64decode(s.encode('utf-8'))
+
+def _utcnowiso() -> str:
+    """Return current UTC time in ISO format."""
+    return datetime.datetime.now(datetime.UTC).isoformat()
+
+def _kmac(b: bytes, password: str, salt: None | bytes = None) -> Tuple[bytes, bytes]:
+    """Compute keyed MAC of bytes b using a key derived from password and salt."""
+
+    if salt is None:
+        salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+
+    key = nacl.pwhash.argon2id.kdf (
+        nacl.hash.BLAKE2B_KEYBYTES,
+        password.encode('utf-8'),
+        salt,
+        opslimit=nacl.pwhash.OPSLIMIT_INTERACTIVE,
+        memlimit=nacl.pwhash.MEMLIMIT_INTERACTIVE
+    )
+
+    return (
+        nacl.hash.blake2b (
+            b,
+            key=key,
+            person=f"{PROGNAME}-{VERSION}".encode('utf-8'),
+            encoder=nacl.encoding.RawEncoder
+        ),
+        salt
+    )
+
+def _encrypt(plain: bytes, aad: bytes, password: str, salt: None | bytes = None) -> Tuple[bytes, bytes]:
+    """Encrypt plain with authenticated associated data aad using password and salt."""
+
+    if salt is None:
+        salt = nacl.utils.random(nacl.pwhash.argon2id.SALTBYTES)
+
+    key = nacl.pwhash.argon2id.kdf (
+        nacl.secret.Aead.KEY_SIZE,
+        password.encode('utf-8'),
+        salt,
+        opslimit=nacl.pwhash.OPSLIMIT_INTERACTIVE,
+        memlimit=nacl.pwhash.MEMLIMIT_INTERACTIVE
+    )
+
+    box = nacl.secret.Aead(key, nacl.encoding.RawEncoder)
+
+    return (box.encrypt(plain, aad), salt)
+
+def _decrypt(secret: bytes, aad: bytes, password: str, salt: bytes) -> bytes:
+    """Decrypt secret after authenticating aad using password and salt."""
+
+    key = nacl.pwhash.argon2id.kdf (
+        nacl.secret.Aead.KEY_SIZE,
+        password.encode('utf-8'),
+        salt,
+        opslimit=nacl.pwhash.OPSLIMIT_INTERACTIVE,
+        memlimit=nacl.pwhash.MEMLIMIT_INTERACTIVE
+    )
+
+    box = nacl.secret.Aead(key, nacl.encoding.RawEncoder)
+
+    return box.decrypt(secret, aad)
+
+class _Database(collections.abc.MutableMapping):
+    """An mypass database.
+    """
+
+    def __init__(self, dbpath: Path):
+        """
+        """
+        if not dbpath.exists():
+            raise FileNotFoundError(f"No database found at {dbpath}.")
+ 
+        try:
+            self._dbpath = dbpath
+            self._connection = sqlite3.connect(dbpath, autocommit=False)
+            dbbytes = self._connection.serialize()
+            self._connection.deserialize(dbbytes)
+        except sqlite3.Error:
+            raise DatabaseError(f"Failed to load {dbpath}.")
+ 
+        try:
+            result_row = self._connection.execute (
+                "SELECT pwhash, enc_salt, mac_salt FROM main WHERE version = ?",
+                (VERSION,)
+            ).fetchone()
+            if result_row is None:
+                raise DatabaseError(f"Failed to fetch main row from database {dbpath}.")
+            self._pwhash = result_row[0]
+            self._enc_salt = _textb64(result_row[1])
+        except sqlite3.Error:
+            raise DatabaseError(f"Some operation on database {dbpath} failed.")
+ 
+        self._password = None
+
+    def _authenticate(self, password: str):
+
+        try:
+            nacl.pwhash.verify(self._pwhash.encode('utf-8'), password.encode('utf-8'))
+        except nacl.exceptions.InvalidkeyError:
+            raise AuthenticationError(f"Failed to authenticate {self._dbpath} using given password.")
+ 
+        self._password = password
+ 
+    def _verify(self):
+
+        assert self._password is not None
+
+        try:
+            result_row = self._connection.execute(
+                "SELECT mac_salt, mac FROM main WHERE version = ?",
+                (VERSION,)
+            ).fetchone()
+        except sqlite3.Error:
+            raise DatabaseError(f"Some operation on database {self._dbpath} failed.")
+
+        if result_row is None:
+            raise DatabaseError(f"Failed to fetch main row from database {dbpath}.")
+
+        mac_salt, mac = result_row
+
+        expected_mac, _ = _kmac(self._all_bytes(), self._password, _textb64(mac_salt))
+
+        if expected_mac != _textb64(mac):
+            raise IntegrityError(f"Database {self._dbpath} failed verification.")
+
+    def _writeback(self):
+
+        if self._connection.total_changes > 0:
+            try:
+                self._connection.execute (
+                    "UPDATE main SET last_updated = ? WHERE version = ?",
+                    (_utcnowiso(), VERSION)
+                )
+                mac, mac_salt = _kmac(self._all_bytes(), self._password) # TODO: Can connection read uncommitted data?
+                self._connection.execute (
+                    "UPDATE main SET mac_salt = ?, mac = ? WHERE version = ?",
+                    (_b64text(mac_salt), _b64text(mac), VERSION)
+                )
+                self._connection.commit()
+                with tempfile.NamedTemporaryFile(suffix='.db', dir=self._dbpath.parent) as tempdbfile:
+                    tempdb = sqlite3.connect(f"{tempdbfile.name}")
+                    with tempdb:
+                        self._connection.backup(tempdb)
+                    tempdb.close()
+                    self._connection.close()
+                    os.replace(tempdbfile.name, self._dbpath)
+            except sqlite3.Error:
+                self._connection.close()
+                raise DatabaseError(f"Failed to write changes to database {self._dbpath}")
+
+        self._connection.close()
+        del self._password
+
+    def __getitem__(self, name: str) -> bytes:
+        """Get the plain-text secret stored in vault name."""
+
+        assert self._password is not None
+
+        try:
+            result_row = self._connection.execute("SELECT secret FROM VAULTS WHERE name = ?",  (name,)).fetchone()
+            if result_row is None:
+                raise VaultNotFoundError(f"Vault {name} not found in database {self._dbpath}.")
+            ciphertext = result_row[0]
+
+            plaintext = _decrypt(_textb64(ciphertext), name.encode('utf-8'), self._password, self._enc_salt)
+            return plaintext
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+        except nacl.exceptions.CryptoError:
+            raise IntegrityError(f"Possibly corrupt secret in vault {name} in {self._dbpath}.")
+
+    def __setitem__(self, name: str, plaintext: bytes):
+        """Store plaintext encrypted and authenticated in vault name.
+
+The secret is stored using authenticated encryption where the name is
+the authenticated, associated data. This means that an attacker cannot
+replace, in an undetectable manner, the stored cipher-text with another
+cipher-text originally stored along with a different vault name.
+        """
+
+        assert self._password is not None
+
+        ciphertext, _ = _encrypt(plaintext, name.encode('utf-8'), self._password, self._enc_salt)
+
+        self._connection.execute (
+            "INSERT OR REPLACE INTO vaults (name, secret) VALUES (?, ?)",
+            (name, _b64text(ciphertext))
+        )
+
+    def __delitem__(self, name: str):
+        """Delete vault name from the database."""
+
+        assert self._password is not None
+
+        try:
+            cursor = self._connection.execute (
+                "DELETE FROM vaults WHERE name = ?",
+                (name, )
+            )
+            if cursor.rowcount == 0:
+                raise VaultNotFoundError(f"Vault {name} not found in database {self._dbpath}.")
+        except sqlite3.Error:
+            raise DatabaseError(f"Vault {name} could not be deleted from database {self._dbpath}.")
+
+    def __iter__(self):
+        """Iterator over vaults."""
+
+        assert self._password is not None
+
+        try:
+            rows = self._connection.execute("SELECT name FROM vaults ORDER BY name").fetchall()
+            return iter(row[0] for row in rows)
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+
+    def __len__(self):
+        """Return the number of vaults in the database."""
+
+        try:
+            result_row = self._connection.execute(
+                "SELECT COUNT(*) FROM vaults"
+            ).fetchone()
+            return result_row[0]
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+
+    def __contains__(self, name):
+
+        try:
+            result_row = self._connection.execute(
+                "SELECT 1 FROM vaults WHERE name = ?", (name,)
+            ).fetchone()
+            return result_row is not None
+        except sqlite3.Error:
+            raise DatabaseError(f"Database {self._dbpath} could not be read.")
+
+    def _all_bytes(self) -> bytes:
+        """Return bytes to compute MAC."""
+
+        try:
+            result_row = self._connection.execute (
+                "SELECT version, last_updated, pwhash, enc_salt FROM MAIN WHERE version = ?",
+                (VERSION,)
+            ).fetchone()
+            if result_row is None:
+                raise DatabaseError(f"Failed to fetch main row from database {self._dbpath}.")
+    
+            version, last_updated, pwhash, enc_salt = result_row
+    
+            data = version.encode('utf-8') + last_updated.encode('utf-8') + pwhash.encode('utf-8') + _textb64(enc_salt)
+    
+            for row in self._connection.execute("SELECT name, secret FROM vaults ORDER BY name"):
+                name = row[0]
+                secret = row[1]
+                data = data + name.encode('utf-8') + _textb64(secret)
+    
+            return data
+        except sqlite3.Error:
+            raise DatabaseError(f"Database operation failed on {self._dbpath}.")
+

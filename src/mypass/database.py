@@ -52,35 +52,34 @@ Usage
 Initialize a database in file "xyz.db" and encrypt all secrets using the
 password "hunter2":
 
-    initialize(Path("xyz.db"), "hunter2")
+    initialize("xyz.db", "hunter2")
 
 Acquire the database "xyz.db" using the password "hunter2" and access
 secrets after decrypting and authenticating.
 
-    with authenticated(Path("xyz.db"), "hunter2") as adb:
+    with authenticated("xyz.db", "hunter2") as adb:
         print('foo =>', adb['foo'].decode('utf-8'))
 
 Same as above but also verify that no tampering has occurred before
 reading any data from the database:
 
-    with verified(Path("xyz.db"), "hunter2") as vdb:
+    with verified("xyz.db", "hunter2") as vdb:
         for vault in vdb:
             print(vault)
 
 Change the password used to encrypt secrets.
 
-    relock(Path("xyz.db"), "hunter2", "hunter3")
+    relock("xyz.db", "hunter2", "hunter3")
 
 Make an authenticated encrypted backup of database "xyz.db" into a file
 "xyz.db.bak":
 
     with open("xyz.db.bak", "wb") as bakfile:
-        backup(Path(f"{name}.db"), "hunter3", "Don't worry. This backup is safe.", bakfile)
+        backup(f"{name}.db", "hunter3", "Keep calm and carry on.", bakfile)
 
 Restore a backup.
 
-    with open("xyz.db", "wb") as dbfile:
-        aad = restore(bakfile, "hunter3", dbfile)
+    aad = restore(bakfile, "hunter3", "xyz.db")
     print("The backup with message \"{aad}\" is restored.")
 """
 
@@ -103,11 +102,11 @@ import nacl.utils
 PROGNAME='mypass'
 VERSION = '0.2'
 
-def initialize(dbpath: Path, password: str) -> None:
+def initialize(dbpath: str | Path, password: str) -> None:
     """Initialize an empty database at dbpath.
 
 Parameters:
-    dbpath (Path): Path to the database file.
+    dbpath (str | Path): Path to the database file.
     password (str): Password to protect the database.
 
 Returns:
@@ -123,6 +122,8 @@ Usage:
 store in a file named "xyz.db". All secrets will be encrypted and
 authenticated using the password "hunter2".
     """
+
+    dbpath = _to_path(dbpath)
 
     if dbpath.exists():
         raise FileExistsError(f"File {dbpath} already exists.")
@@ -182,11 +183,11 @@ authenticated using the password "hunter2".
     
 
 @contextlib.contextmanager
-def authenticated(dbpath: Path, password: str):
+def authenticated(dbpath: str | Path, password: str):
     """Acquire an authenticated database from dbpath using password.
 
 Parameters:
-    dbpath (Path): Path to the database file.
+    dbpath (str | Path): Path to the database file.
     password (str): Password to authenticate.
 
 Raises:
@@ -212,17 +213,18 @@ secret in plain-text for a key.
 exceptions is raised.
     """
 
+    dbpath = _to_path(dbpath)
     db = _Database(dbpath)
     db._authenticate(password)
     yield db
     db._writeback()
 
 @contextlib.contextmanager
-def verified(dbpath: Path, password: str):
+def verified(dbpath: str | Path, password: str):
     """Acquire a fully verified database from dbpath using password.
 
 Parameters:
-    dbpath (Path): Path to the database file.
+    dbpath (str | Path): Path to the database file.
     password (str): Password to verify the database.
 
 Raises:
@@ -250,6 +252,8 @@ database.
     Upon exit, all changes are written back to "xyz.db" or one of the
 exceptions is raised.
 """
+
+    dbpath = _to_path(dbpath)
     db = _Database(dbpath)
     db._authenticate(password)
     db._verify()
@@ -257,11 +261,11 @@ exceptions is raised.
     db._writeback()
 
 
-def relock(dbpath: Path, old_password: str, new_password: str):
+def relock(dbpath: str | Path, old_password: str, new_password: str):
     """Relock the database using a new password.
 
 Parameters:
-    dbpath (Path): Path to the database file.
+    dbpath (str | Path): Path to the database file.
     old_password (str): Old password locking the database.
     new_password (str): New password to lock the database
 
@@ -274,6 +278,8 @@ Raises:
     AuthenticationError: If old_password verification failed..
     DatabaseError: If some database operation failed.
     """
+
+    dbpath = _to_path(dbpath)
 
     temp_path = None
 
@@ -298,14 +304,15 @@ Raises:
             except Exception:
                 pass
 
-def backup(dbpath: Path, aad: str, password: str, fobj: io.FileIO) -> None:
+
+def backup(dbpath: str | Path, aad: str, password: str, fobj: io.BytesIO) -> None:
     """Backup the database into a file-like object.
 
 All contents of the database are encrypted and authenticated in the
 file-like object. In particular, the keys are encrypted as well.
 
 Parameters:
-    dbpath (Path): Path to the database file.
+    dbpath (str | Path): Path to the database file.
     aad (str): Authenticated associated data in the backup file.
     password (str): Old password locking the database.
 
@@ -319,21 +326,70 @@ Raises:
     ValueError: If the aad is too long.
     """
 
-    pass
+    dbpath = _to_path(dbpath)
 
-def restore(infile: io.FileIO, password: str, outfile: io.FileIO) -> str:
-    """Restore a database into outfile from infile.
+    aad_bytes = aad.encode('utf-8')
+    n = len(aad_bytes)
+    if n > 255:
+        raise ValueError(f"AAD is too long (must be at most 255 bytes).")
+
+    with verified(dbpath, password) as vdb:
+        dbbytes = vdb._connection.serialize()
+        ciphertext, salt = _encrypt(dbbytes, aad, password)
+        fobj.write(_BACKUP_MAGIC)
+        fobj.write(int.to_bytes(n))
+        fobj.write(aad_bytes)
+        fobj.write(salt)
+        fobj.write(ciphertext)
+
+def restore(infile: io.BytesIO, password: str, dbpath: Path) -> str:
+    """Restore a database into dbpath from infile.
+
+Parameters:
+    infile (io.BytesIO): Binary file-like object storing backup.
+    password (str): The main password for the database.
+    dbpath (Path): Path to the restored database file.
 
 Returns:
     str: Authenticated associated data upon successful restore.
 
 Raises:
-    FileExistsError: If there is a file at dbpath.
-    IntegrityError: If the backup in fobj or the restored database is corrupt.
-    AuthenticationError: If password verification failed..
+    IntegrityError: If the backup in infile or the restored database is corrupt.
+    AuthenticationError: If password verification failed.
+    DatabaseError: If writing to dbpath failed.
     """
 
-    pass
+    if infile.read(len(_BACKUP_MAGIC)) != _BACKUP_MAGIC:
+        raise IntegrityError("Corrupt header in backup.")
+
+    n = int.from_bytes(infile.read())
+    aad_bytes = infile.read(n)
+    if len(aad_bytes) != n:
+        raise IntegrityError("Corrupt backup.")
+
+    try:
+        aad = aad_bytes.decode('utf-8')
+    
+        salt = infile.read(_BACKUP_SALT_LEN)
+        ciphertext = infile.readall()
+    
+        plaintext = _decrypt(ciphertext, aad, password, salt)
+    except UnicodeDecodeError:
+        raise IntegrityError("Corrupt AAD in backup.")
+    except nacl.exceptions.CryptoError:
+        raise AuthenticationError("Failed to decrypt backup.")
+
+    with tempfile.NamedTemporaryFile(suffix='.db', mode='wb', dir=dbpath.parent) as temp_file:
+        temp_file.write(plaintext)
+        with verified(temp_file.name, password):
+            pass
+
+        try:
+            os.replace(temp_file.name, dbpath)
+        except OSError:
+            raise DatabaseError("Failed to make database {dbpath}.")
+
+    return aad
 
 class DatabaseError(Exception):
     pass
@@ -347,16 +403,26 @@ class IntegrityError(Exception):
 class VaultNotFoundError(KeyError):
     pass
 
+def _to_path(p: str | Path) -> Path:
+    """Make a Path object from p."""
+
+    if isinstance(p, str):
+        return Path(p)
+    return p
+
 def _b64text(b: bytes) -> str:
     """A Python string of the base64 encoding of bytes b."""
+
     return base64.b64encode(b).decode('utf-8')
 
 def _textb64(s: str) -> bytes:
     """Bytes by decoding base64 string."""
+
     return base64.b64decode(s.encode('utf-8'))
 
 def _utcnowiso() -> str:
     """Return current UTC time in ISO format."""
+
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 def _kmac(b: bytes, password: str, salt: None | bytes = None) -> Tuple[bytes, bytes]:
@@ -493,7 +559,7 @@ class _Database(collections.abc.MutableMapping):
                     (_b64text(mac_salt), _b64text(mac), VERSION)
                 )
                 self._connection.commit()
-                with tempfile.NamedTemporaryFile(suffix='.db', dir=self._dbpath.parent) as tempdbfile:
+                with tempfile.NamedTemporaryFile(suffix='.db', mode='wb', dir=self._dbpath.parent) as tempdbfile:
                     tempdb = sqlite3.connect(f"{tempdbfile.name}")
                     with tempdb:
                         self._connection.backup(tempdb)
@@ -614,3 +680,5 @@ cipher-text originally stored along with a different vault name.
         except sqlite3.Error:
             raise DatabaseError(f"Database operation failed on {self._dbpath}.")
 
+_BACKUP_MAGIC = b'mypass-0.2-backup'
+_BACKUP_SALT_LEN = nacl.pwhash.argon2id.SALTBYTES
